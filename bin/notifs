@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""notifs - the archive behind the Notifications bar panel.
+
+  notifs sync            take new notifications from Omarchy's history, prune old
+  notifs list            JSON for the panel: entries newest first, and lastSeen
+  notifs seen            mark everything as read
+  notifs remove KEY      delete one notification
+  notifs clear           delete them all
+  notifs import-legacy   bring over what jankeesvw.notification-center kept
+
+Omarchy's notification service writes every notification to
+~/.local/state/omarchy/notifications/history/ and keeps the last ten. This copies
+each one out as it lands, with its icon and picture, and keeps it for 30 days
+(at most 1000). The archive holds everything you were sent, two-factor codes
+included, so it lives in a 0700 directory and never leaves the machine.
+"""
+
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+HISTORY_DIR = os.path.join(STATE_HOME, "omarchy/notifications/history")
+STORE = os.path.join(STATE_HOME, "omarchy/plugins/notification-center")
+ARCHIVE = os.path.join(STORE, "archive.jsonl")
+SEEN = os.path.join(STORE, "seen")
+# Omarchy keeps its last ten notifications on disk, so without these a cleared
+# or removed notification would come straight back on the next sync.
+CLEARED_AT = os.path.join(STORE, "cleared_at")
+DISMISSED = os.path.join(STORE, "dismissed")
+IMAGES = os.path.join(STORE, "images")
+LEGACY = os.path.join(STATE_HOME, "omarchy-notification-center")
+
+KEEP_DAYS = 30
+MAX_ITEMS = 1000
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_TEXT = 2000
+
+# Icon theme names and app names come from whoever sent the notification.
+ICON_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# A picture a click may open: absolute, no quotes or newlines, an image file.
+PICTURE_RE = re.compile(r"""^(file://)?/[^"'\r\n]*\.(jpe?g|png|webp|gif)$""", re.I)
+
+
+@contextmanager
+def locked():
+    os.makedirs(IMAGES, mode=0o700, exist_ok=True)
+    os.chmod(STORE, 0o700)
+    with open(os.path.join(STORE, "lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def read_archive():
+    entries = []
+    try:
+        with open(ARCHIVE) as f:
+            for line in f:
+                try:
+                    entries.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return entries
+
+
+def write_archive(entries):
+    tmp = ARCHIVE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    os.replace(tmp, ARCHIVE)
+
+
+def is_image(path):
+    out = subprocess.run(["file", "-bL", "--mime-type", "--", path], capture_output=True, text=True).stdout
+    return out.startswith("image/")
+
+
+def copy_image(src, key, slot, shrink=False):
+    """Copy a picture the notification pointed at into the store, or "".
+
+    The originals go away with the ten files Omarchy keeps. Paths arrive from
+    the sender, so only real images, of bounded size, are copied: an icon "at"
+    ~/.ssh/id_ed25519 must not become a second copy of it in here.
+    """
+    if not src:
+        return ""
+    src = src.removeprefix("file://")
+    if not src.startswith("/") or not os.path.isfile(src):
+        return ""
+    try:
+        if os.path.getsize(src) > MAX_IMAGE_BYTES or not is_image(src):
+            return ""
+    except OSError:
+        return ""
+    dest = os.path.join(IMAGES, f"{key}-{slot}")
+    try:
+        if shrink and shutil.which("magick"):
+            # Kept at the size the panel shows it, not the camera's.
+            done = subprocess.run(
+                ["magick", src, "-auto-orient", "-resize", "720x720>", "-quality", "82", dest],
+                capture_output=True,
+            ).returncode == 0
+            if not done:
+                shutil.copyfile(src, dest)
+        else:
+            shutil.copyfile(src, dest)
+        os.chmod(dest, 0o600)
+    except OSError:
+        return ""
+    return "file://" + dest
+
+
+def picture_of(exec_argv):
+    """The picture a notification is about, read out of its click action.
+
+    Cameras and screenshot tools hand their file to the action instead of
+    setting an image. The action itself is never kept or run: it is chosen by
+    the sender, and a stored one would be a command waiting for a click.
+    """
+    if not exec_argv:
+        return ""
+    try:
+        argv = json.loads(exec_argv)
+    except ValueError:
+        argv = None
+    if isinstance(argv, list):
+        candidates = [a for a in argv if isinstance(a, str)]
+    else:
+        # Older shell-string actions: a space separates arguments there.
+        candidates = re.findall(r"""(?:file://)?/[^"' ]*\.(?:jpe?g|png|webp|gif)""", str(exec_argv), re.I)
+    for candidate in candidates:
+        if PICTURE_RE.match(candidate):
+            return candidate.removeprefix("file://")
+    return ""
+
+
+def plain(text):
+    text = re.sub(r"<[^>]+>", "", str(text or ""))
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&amp;", "&")
+    return text.strip()[:MAX_TEXT]
+
+
+def history_key(data):
+    return f'{int(data.get("timestamp", 0))}-{int(data.get("originalId", data.get("id", 0)))}'
+
+
+def entry_from_history(data):
+    key = history_key(data)
+    icon = str(data.get("appIcon") or "")
+    if icon.startswith("/") or icon.startswith("file://"):
+        icon = copy_image(icon, key, "appIcon")
+    elif not ICON_NAME_RE.match(icon):
+        icon = ""
+    picture = picture_of(data.get("execArgv") or data.get("exec") or "")
+    return {
+        "key": key,
+        "app": plain(data.get("app"))[:64],
+        "appIcon": icon,
+        "summary": plain(data.get("summary")),
+        "body": plain(data.get("body")),
+        "image": copy_image(str(data.get("image") or ""), key, "image"),
+        "preview": copy_image(picture, key, "preview", shrink=True),
+        "file": picture,
+        "urgency": int(data.get("urgency", 1) or 1),
+        "timestamp": int(data.get("timestamp", 0)),
+    }
+
+
+def drop_images(key):
+    for slot in ("appIcon", "image", "preview"):
+        try:
+            os.remove(os.path.join(IMAGES, f"{key}-{slot}"))
+        except OSError:
+            pass
+
+
+def prune(entries):
+    cutoff = (time.time() - KEEP_DAYS * 86400) * 1000
+    entries.sort(key=lambda e: e["timestamp"], reverse=True)
+    keep = [e for e in entries if e["timestamp"] >= cutoff][:MAX_ITEMS]
+    kept = {e["key"] for e in keep}
+    for entry in entries:
+        if entry["key"] not in kept:
+            drop_images(entry["key"])
+    return keep
+
+
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def read_dismissed():
+    try:
+        with open(DISMISSED) as f:
+            return [line.strip() for line in f if line.strip()]
+    except OSError:
+        return []
+
+
+def write_private(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+def sync():
+    with locked():
+        entries = read_archive()
+        cleared_at = read_int(CLEARED_AT)
+        known = {e["key"] for e in entries} | set(read_dismissed())
+        try:
+            names = sorted(os.listdir(HISTORY_DIR))
+        except OSError:
+            names = []
+        added = False
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(HISTORY_DIR, name)) as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            # Decided before anything is copied: already kept, removed, or
+            # older than the last Clear all.
+            if history_key(data) in known or int(data.get("timestamp", 0)) <= cleared_at:
+                continue
+            entry = entry_from_history(data)
+            entries.append(entry)
+            known.add(entry["key"])
+            added = True
+        pruned = prune(entries)
+        if added or len(pruned) != len(entries):
+            write_archive(pruned)
+
+
+def read_seen():
+    return read_int(SEEN)
+
+
+def list_json():
+    entries = sorted(read_archive(), key=lambda e: e["timestamp"], reverse=True)
+    print(json.dumps({"lastSeen": read_seen(), "entries": entries}, ensure_ascii=False))
+
+
+def mark_seen():
+    with locked():
+        with open(SEEN, "w") as f:
+            f.write(str(int(time.time() * 1000)))
+
+
+def remove(key):
+    with locked():
+        entries = read_archive()
+        keep = [e for e in entries if e["key"] != key]
+        if len(keep) != len(entries):
+            drop_images(key)
+            write_archive(keep)
+        # Only the last few matter: Omarchy's history holds ten.
+        dismissed = [k for k in read_dismissed() if k != key][-200:] + [key]
+        write_private(DISMISSED, "\n".join(dismissed) + "\n")
+
+
+def clear():
+    with locked():
+        entries = read_archive()
+        newest = max([e["timestamp"] for e in entries] + [read_int(CLEARED_AT)])
+        for entry in entries:
+            drop_images(entry["key"])
+        write_archive([])
+        write_private(CLEARED_AT, str(max(newest, int(time.time() * 1000))))
+
+
+def import_legacy():
+    """Bring over what jankeesvw.notification-center kept and still showed:
+    nothing it had cleared or dismissed."""
+    try:
+        with open(os.path.join(LEGACY, "cleared_at")) as f:
+            cleared_at = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        cleared_at = 0
+    try:
+        with open(os.path.join(LEGACY, "dismissed")) as f:
+            dismissed = {line.strip() for line in f if line.strip()}
+    except OSError:
+        dismissed = set()
+    try:
+        with open(os.path.join(LEGACY, "archive.jsonl")) as f:
+            lines = f.readlines()
+    except OSError:
+        sys.exit("notifs: no jankeesvw.notification-center archive to import")
+
+    with locked():
+        entries = read_archive()
+        known = {e["key"] for e in entries}
+        count = 0
+        for line in lines:
+            try:
+                old = json.loads(line)
+            except ValueError:
+                continue
+            key = str(old.get("key") or "")
+            if not re.match(r"^\d+-\d+$", key) or key in known or key in dismissed:
+                continue
+            if int(old.get("timestamp", 0)) <= cleared_at:
+                continue
+            icon = str(old.get("appIcon") or "")
+            if icon.startswith("file://") or icon.startswith("/"):
+                icon = copy_image(icon, key, "appIcon")
+            elif not ICON_NAME_RE.match(icon):
+                icon = ""
+            picture = str(old.get("file") or "")
+            entries.append({
+                "key": key,
+                "app": plain(old.get("app"))[:64],
+                "appIcon": icon,
+                "summary": plain(old.get("summary")),
+                "body": plain(old.get("body")),
+                "image": copy_image(str(old.get("image") or ""), key, "image"),
+                "preview": copy_image(str(old.get("preview") or ""), key, "preview"),
+                "file": picture if PICTURE_RE.match(picture) else "",
+                "urgency": int(old.get("urgency", 1) or 1),
+                "timestamp": int(old.get("timestamp", 0)),
+            })
+            known.add(key)
+            count += 1
+        write_archive(prune(entries))
+    print(f"imported {count}")
+
+
+def main(argv):
+    cmd, args = (argv[0], argv[1:]) if argv else ("", [])
+    if cmd == "sync" and not args:
+        sync()
+    elif cmd == "list" and not args:
+        list_json()
+    elif cmd == "seen" and not args:
+        mark_seen()
+    elif cmd == "remove" and len(args) == 1:
+        remove(args[0])
+    elif cmd == "clear" and not args:
+        clear()
+    elif cmd == "import-legacy" and not args:
+        import_legacy()
+    else:
+        sys.exit(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

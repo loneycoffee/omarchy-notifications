@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "notification-center",
+  "name": "Notifications",
+  "version": "1.0.0",
+  "author": "loneycoffee",
+  "license": "MIT",
+  "homepage": "https://github.com/loneycoffee/omarchy-notifications",
+  "description": "A bell on the bar and a panel with every notification you were sent over the last 30 days, under the day it arrived, with its app's icon, a search field and Do Not Disturb. Built on Omarchy's own notification service, which keeps showing the popups. Toggle the panel with: omarchy-shell shell toggle notification-center",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Notifications",
+    "description": "Notification history with search and Do Not Disturb",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
